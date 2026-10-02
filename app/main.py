@@ -13,7 +13,8 @@ from .plates import parse_well
 from .blinding import BlindInvalid, blind, unblind
 from .reconciler import ReconcileInvalid, StagingConflict, reconcile
 from .release import ReleaseInvalid, batch_release
-from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, ReconcileRequest, SpatialQCRequest, UnblindRequest
+from .dilution import DilutionPlanInvalid, plan_dilution
+from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, DilutionPlanRequest, ReconcileRequest, SpatialQCRequest, UnblindRequest
 from .spatial_qc import SpatialQCInvalid, spatial_qc
 
 app = FastAPI(
@@ -146,6 +147,22 @@ async def blind_invalid_handler(request: Request, exc: BlindInvalid) -> JSONResp
             "detail": "The blinding request failed; "
             "no blind codes, mapping package or shares are produced "
             "(unblinding reveals no partial mapping).",
+            "infeasibility_categories": exc.categories,
+            "messages": exc.messages,
+        },
+    )
+
+
+@app.exception_handler(DilutionPlanInvalid)
+async def dilution_plan_invalid_handler(request: Request, exc: DilutionPlanInvalid) -> JSONResponse:
+    # 422: shared stock shortfall, well-capacity or pipetting-grid failures
+    # make at least one target unreachable; every reason is listed and no
+    # partial pipetting plan is produced.
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "The dilution gradient cannot be prepared as requested; "
+            "no partial pipetting plan was produced.",
             "infeasibility_categories": exc.categories,
             "messages": exc.messages,
         },
@@ -293,6 +310,18 @@ async def spatial_qc_arrangement(req: SpatialQCRequest) -> dict:
 )
 async def batch_release_arrangement(req: BatchReleaseRequest) -> dict:
     return batch_release(req)
+
+
+@app.post(
+    "/api/v1/arrangements/dilution-plan",
+    summary="为既有编排结果配制稀释梯度:共享库存下的确定性逐步移液计划",
+    responses={
+        200: {"description": "返回逐步移液指令、每孔实际浓度与各来源余量"},
+        422: {"description": "来源不足、孔容量超限或分辨率取整后浓度无法达标等,逐项列出原因,不输出部分计划"},
+    },
+)
+async def create_dilution_plan(req: DilutionPlanRequest) -> dict:
+    return plan_dilution(req)
 
 
 @app.post(

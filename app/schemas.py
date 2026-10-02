@@ -57,6 +57,18 @@ VIOLATION_BLIND_SHARE_INVALID = "BLIND_SHARE_INVALID"
 VIOLATION_BLIND_PACKAGE_INVALID = "BLIND_PACKAGE_INVALID"
 VIOLATION_BLIND_INTEGRITY_FAILED = "BLIND_INTEGRITY_FAILED"
 
+# Categories reported in 422 responses of the dilution-plan endpoint.
+VIOLATION_DILUTION_SOURCE_DUPLICATED = "DILUTION_SOURCE_DUPLICATED"
+VIOLATION_DILUTION_SOURCE_UNKNOWN = "DILUTION_SOURCE_UNKNOWN"
+VIOLATION_DILUTION_TARGET_WELL_DUPLICATED = "DILUTION_TARGET_WELL_DUPLICATED"
+VIOLATION_DILUTION_TARGET_WELL_NOT_IN_LAYOUT = "DILUTION_TARGET_WELL_NOT_IN_LAYOUT"
+VIOLATION_DILUTION_TARGET_CONCENTRATION_INVALID = "DILUTION_TARGET_CONCENTRATION_INVALID"
+VIOLATION_DILUTION_VOLUME_INVALID = "DILUTION_VOLUME_INVALID"
+VIOLATION_DILUTION_WELL_CAPACITY_EXCEEDED = "DILUTION_WELL_CAPACITY_EXCEEDED"
+VIOLATION_DILUTION_SOURCE_INSUFFICIENT = "DILUTION_SOURCE_INSUFFICIENT"
+VIOLATION_DILUTION_MIN_VOLUME_VIOLATION = "DILUTION_MIN_VOLUME_VIOLATION"
+VIOLATION_DILUTION_TOLERANCE_UNREACHABLE = "DILUTION_TOLERANCE_UNREACHABLE"
+
 
 class PlateSpec(BaseModel):
     """Plate geometry.
@@ -319,3 +331,97 @@ class UnblindRequest(BaseModel):
         max_length=2,
         description="两份不同的密钥份额(顺序不敏感);缺少、相同或多余均拒绝",
     )
+
+
+class DilutionSource(BaseModel):
+    """A source sample stock with known concentration and usable volume.
+
+    Volumes are in microlitres; concentration units are arbitrary but must be
+    identical across source stocks and target wells (e.g. ng/uL). The same
+    source may feed several target wells; its available volume is shared.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, description="来源样本 id,必须出现在 layout 中")
+    concentration: float = Field(gt=0, description="来源液浓度(>0)")
+    available_volume: float = Field(gt=0, description="该来源的可用体积(µL,>0),多目标共享")
+
+
+class DilutionTarget(BaseModel):
+    """One target well requiring a specified final concentration/volume."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    well: str = Field(min_length=1, description="目标孔位,如 'C5',必须是 layout 中的已占孔")
+    target_concentration: float = Field(ge=0, description="目标浓度(≥0;0 表示只用稀释液)")
+    final_volume: float = Field(gt=0, description="目标终体积(µL,>0),必须是移液分辨率的整数倍")
+
+
+class DilutionPlanRequest(BaseModel):
+    """Dilution-gradient preparation plan for an existing arrangement.
+
+    ``layout`` is the sample → well mapping exactly as returned in the
+    ``layout`` field of ``POST /api/v1/arrangements``; each target well must
+    name the well occupied in that layout by the source sample it should be
+    filled from. The service computes, per target well, how much source stock
+    and how much diluent to pipette so that the realized concentration (after
+    rounding every transfer to ``pipette_resolution``) stays within
+    ``relative_tolerance`` (or ``absolute_tolerance``) of the requested
+    concentration, while the shared source inventories cover all draws. Any
+    single failure (short stock, well capacity, minimum aspirate, rounding
+    outside tolerance) aborts the whole request with 422 and itemized reasons;
+    no partial plan is returned. Identical inputs yield an identical plan.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    plate: PlateSpec = Field(default_factory=PlateSpec)
+    layout: dict[str, str] = Field(
+        min_length=1, description="布局映射:样本 id → 孔位(编排接口响应中的 layout)"
+    )
+    sources: list[DilutionSource] = Field(min_length=1)
+    targets: list[DilutionTarget] = Field(min_length=1)
+    well_capacity: float = Field(gt=0, description="每个目标孔的容量上限(µL,>0),终体积不得超过")
+    diluent: str = Field(min_length=1, description="稀释液标识,如 'PBS'")
+    pipette_resolution: float = Field(gt=0, description="移液分辨率(µL,>0);每次移液体积均为其整数倍")
+    min_pipette_volume: float = Field(
+        gt=0, description="最小吸取量(µL,>0);每次移液体积为 0 或 ≥ 该值"
+    )
+    relative_tolerance: float = Field(
+        gt=0, le=1, description="相对浓度误差上限(分数,如 0.01 表示 1%),>0"
+    )
+    absolute_tolerance: float = Field(
+        default=0.0,
+        ge=0,
+        description="绝对浓度误差上限(≥0,默认 0);实际误差 ≤ 相对或绝对上限即达标",
+    )
+
+    @field_validator(
+        "pipette_resolution",
+        "min_pipette_volume",
+        "well_capacity",
+        "relative_tolerance",
+        "absolute_tolerance",
+    )
+    @classmethod
+    def _finite_positive(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("must be a finite number")
+        return v
+
+    @field_validator("sources")
+    @classmethod
+    def _sources_finite(cls, v: list[DilutionSource]) -> list[DilutionSource]:
+        for s in v:
+            if not math.isfinite(s.concentration) or not math.isfinite(s.available_volume):
+                raise ValueError(f"source '{s.id}' values must be finite")
+        return v
+
+    @field_validator("targets")
+    @classmethod
+    def _targets_finite(cls, v: list[DilutionTarget]) -> list[DilutionTarget]:
+        for t in v:
+            if not math.isfinite(t.target_concentration) or not math.isfinite(t.final_volume):
+                raise ValueError(f"target well '{t.well}' values must be finite")
+        return v

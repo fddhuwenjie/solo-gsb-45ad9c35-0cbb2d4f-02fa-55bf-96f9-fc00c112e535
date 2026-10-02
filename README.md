@@ -27,6 +27,7 @@ docker compose up --build
 - 纠位接口： `POST http://localhost:8000/api/v1/arrangements/reconcile`
 - 空间质控接口： `POST http://localhost:8000/api/v1/arrangements/spatial-qc`
 - 批次放行核验： `POST http://localhost:8000/api/v1/arrangements/batch-release`
+- 稀释梯度配制： `POST http://localhost:8000/api/v1/arrangements/dilution-plan`
 - 双人协作盲化： `POST http://localhost:8000/api/v1/blinding/blind`
 - 双人协作解盲： `POST http://localhost:8000/api/v1/blinding/unblind`
 
@@ -544,6 +545,155 @@ curl -X POST http://localhost:8000/api/v1/arrangements/batch-release \
 }
 ```
 
+## 稀释梯度配制 `POST /api/v1/arrangements/dilution-plan`
+
+为**既有编排结果**（编排接口响应中的 `layout`，即 sample_id → well 映射）
+生成稀释梯度的**确定性逐步移液计划**。调用方提交目标 layout、每个来源样本的
+**浓度与可用体积**、各目标孔的**目标浓度与终体积**、目标孔**容量上限**、
+**稀释液**标识以及移液**分辨率**与**最小吸取量**。同一来源在多个目标孔间
+**共享库存**（取液量跨孔累加后与可用体积核对）。
+
+每个目标孔按单级稀释（来源液 + 稀释液）计算：
+
+- 理想取液量 `v* = V · c目标 / c来源`，取液量按 `pipette_resolution` 取整到
+  最近的分辨率整数格点（并列时取**较小**取液量，保证确定性）；
+- 取整后的实际浓度 `c实际 = c来源 · v / V` 必须满足
+  `|c实际 − c目标| ≤ max(relative_tolerance · c目标, absolute_tolerance)`;
+- 每次非零移液（来源液与稀释液分别）都必须是分辨率的整数倍且
+  **≥ `min_pipette_volume`**；终体积 `V` 本身必须是分辨率的整数倍，
+  且不得超过 `well_capacity`；目标浓度为 `0` 的孔只加稀释液，
+  目标浓度等于来源浓度的孔只加来源液。
+
+**任一**目标孔因来源不足、孔容量、最小吸取量或分辨率取整而无法达标，
+整次请求返回 422 并在 `messages` 中**逐项列出全部原因**，**不输出任何部分
+计划**（无孔计划、无指令、无余量）。计算过程不含随机性，相同输入必然得到
+完全相同的计划。
+
+端口 `8000` 调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/arrangements/dilution-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plate": {"type": "24"},
+    "layout": {"S1": "A1", "S2": "A2", "S3": "B1"},
+    "sources": [
+      {"id": "S1", "concentration": 100.0, "available_volume": 100.0},
+      {"id": "S2", "concentration": 80.0,  "available_volume": 60.0},
+      {"id": "S3", "concentration": 50.0,  "available_volume": 30.0}
+    ],
+    "targets": [
+      {"well": "A1", "target_concentration": 50.0, "final_volume": 100.0},
+      {"well": "A2", "target_concentration": 20.0, "final_volume": 100.0},
+      {"well": "B1", "target_concentration": 10.0, "final_volume": 100.0}
+    ],
+    "well_capacity": 200.0,
+    "diluent": "PBS",
+    "pipette_resolution": 1.0,
+    "min_pipette_volume": 2.0,
+    "relative_tolerance": 0.01,
+    "absolute_tolerance": 0.5
+  }'
+```
+
+### 请求字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `plate` | object | 板型，与编排接口相同（默认 `"96"`) |
+| `layout` | object | 布局映射：样本 id → 孔位（编排接口响应中的 `layout`)；目标孔必须是其中的已占孔 |
+| `sources[]` | array | 来源样本列表，每项 `{id, concentration, available_volume}`；`id` 必须出现在 `layout` 中且不得重复；同一来源可供给多个目标孔，体积跨孔共享 |
+| `targets[]` | array | 目标孔列表，每项 `{well, target_concentration, final_volume}`；孔位不得重复；目标浓度 ≥0（`0` 表示纯稀释液），终体积 >0 且为分辨率整数倍 |
+| `well_capacity` | float | **目标孔容量上限（µL,>0,必填)**；每孔终体积不得超过 |
+| `diluent` | string | **稀释液标识（非空，必填)**，如 `"PBS"`，会出现在指令中 |
+| `pipette_resolution` | float | **移液分辨率（µL,>0,必填)**；每次移液体积都是其整数倍 |
+| `min_pipette_volume` | float | **最小吸取量（µL,>0,必填)**；每次非零移液都必须 ≥ 该值 |
+| `relative_tolerance` | float | **相对浓度误差上限（分数，必填，0–1)**，如 `0.01` 表示 1% |
+| `absolute_tolerance` | float | 绝对浓度误差上限（≥0，默认 `0`)；实际浓度误差 ≤ 相对或绝对上限即达标 |
+
+体积单位为 µL；浓度单位任意，但来源浓度与目标浓度必须使用同一单位
+（如 ng/µL)。`layout` 可以是 `targets` 的超集（未列入的孔不参与本次配制）。
+
+### 响应（200)
+
+```json
+{
+  "plate": {"type": "24", "rows": 4, "columns": 6},
+  "parameters": {
+    "diluent": "PBS", "well_capacity": 200.0,
+    "pipette_resolution": 1.0, "min_pipette_volume": 2.0,
+    "relative_tolerance": 0.01, "absolute_tolerance": 0.5
+  },
+  "wells": [
+    {"well": "A1", "source_id": "S1",
+     "target_concentration": 50.0, "actual_concentration": 50.0,
+     "absolute_error": 0.0, "relative_error": 0.0,
+     "final_volume": 100.0, "stock_volume": 50.0, "diluent_volume": 50.0},
+    {"well": "A2", "source_id": "S2",
+     "target_concentration": 20.0, "actual_concentration": 20.0,
+     "absolute_error": 0.0, "relative_error": 0.0,
+     "final_volume": 100.0, "stock_volume": 25.0, "diluent_volume": 75.0}
+  ],
+  "sources": [
+    {"source_id": "S1", "well": "A1", "concentration": 100.0,
+     "available_volume": 100.0, "used_volume": 50.0, "remaining_volume": 50.0},
+    {"source_id": "S2", "well": "A2", "concentration": 80.0,
+     "available_volume": 60.0, "used_volume": 25.0, "remaining_volume": 35.0}
+  ],
+  "instruction_count": 4,
+  "instructions": [
+    {"step": 1, "phase": "dispense_diluent", "target_well": "A1",
+     "source_id": null, "reagent": "PBS", "volume": 50.0},
+    {"step": 2, "phase": "dispense_diluent", "target_well": "A2",
+     "source_id": null, "reagent": "PBS", "volume": 75.0},
+    {"step": 3, "phase": "transfer_stock", "target_well": "A1",
+     "source_id": "S1", "reagent": null, "volume": 50.0},
+    {"step": 4, "phase": "transfer_stock", "target_well": "A2",
+     "source_id": "S2", "reagent": null, "volume": 25.0}
+  ],
+  "verification": {
+    "all_concentrations_within_tolerance": true,
+    "all_volumes_on_resolution_grid": true,
+    "all_wells_within_capacity": true,
+    "all_draws_above_minimum": true,
+    "instruction_volumes_conserved": true,
+    "all_sources_sufficient": true
+  }
+}
+```
+
+- `wells`：逐孔给出目标/实际浓度、绝对与相对误差、终体积及来源液与稀释液
+  体积，按行优先（孔位）排序。
+- `sources`：逐来源给出库存总量、跨孔累计取液量与**剩余量**
+  (`remaining_volume = available_volume − used_volume`)，按来源 id 排序。
+- `instructions`：确定性的逐步移液指令，分两个阶段：**先**对所有目标孔
+  按行优先顺序加入稀释液（`dispense_diluent`),**再**按相同顺序转入各来源液
+  （`transfer_stock`，先加稀释液可直接吹打到液体中）；目标浓度为 0 / 等于
+  来源浓度的孔只出现其中一条指令。
+- `verification`：对计划的独立复核（浓度全部达标、体积全部落在分辨率格点上、
+  未超孔容量、非零移液均 ≥ 最小吸取量、每孔体积守恒、全部来源库存充足）。
+
+### 无法配制（422，不输出部分计划）
+
+任一条件不满足即返回 422，响应在 `infeasibility_categories` 与 `messages`
+中列出**全部**问题（含具体孔位/来源与数值），**不含** `wells`、
+`instructions`、`sources` 等任何部分计划：
+
+| 类别 | 含义 |
+| --- | --- |
+| `DILUTION_SOURCE_INSUFFICIENT` | 同一来源跨孔累计取液量超过其可用体积（共享库存不足），消息给出需求量、可用量与缺口 |
+| `DILUTION_WELL_CAPACITY_EXCEEDED` | 某孔终体积超过 `well_capacity` |
+| `DILUTION_VOLUME_INVALID` | 某孔终体积不是 `pipette_resolution` 的整数倍（服务不对终体积取整） |
+| `DILUTION_MIN_VOLUME_VIOLATION` | 某孔任一非零移液无法达到 `min_pipette_volume`（含终体积本身小于最小吸取量） |
+| `DILUTION_TOLERANCE_UNREACHABLE` | 分辨率格点上不存在使浓度误差落入容差的取液量，消息给出可达到的最优误差 |
+| `DILUTION_TARGET_CONCENTRATION_INVALID` | 目标浓度高于来源浓度（单级稀释只能稀释、不能浓缩） |
+| `DILUTION_SOURCE_DUPLICATED` | `sources` 中来源 id 重复 |
+| `DILUTION_SOURCE_UNKNOWN` | 来源不在 `layout` 中，或目标孔占用样本未提供来源浓度/体积 |
+| `DILUTION_TARGET_WELL_DUPLICATED` | 目标孔重复（含大小写归一后重复，如 `"a1"` 与 `"A1"`) |
+| `DILUTION_TARGET_WELL_NOT_IN_LAYOUT` | 目标孔不是 `layout` 中的已占孔 |
+| `WELL_REFERENCE_INVALID` / `PLATE_DIMENSION_INVALID` | 孔位名称非法或越界 / 板型尺寸非法 |
+| `REQUEST_VALIDATION_ERROR` | 请求体结构不合法（缺字段、越界、`NaN`/`Infinity`、多余字段等） |
+
 ## 双人协作盲化 `POST /api/v1/blinding/blind`
 
 为**既有编排结果**（编排接口响应中的 `layout`，即 sample_id → well 映射）
@@ -705,6 +855,10 @@ curl -X POST http://localhost:8000/api/v1/blinding/unblind \
 - 批次放行核验完全复用上述纠位规则与空间质控流程，相同
   （输入， seed)（含 `max_spatial_effect`/`min_p_value` 等门控参数）
   必然得到相同的错孔清单、放行结论、门控观测值与质控摘要。
+- 稀释梯度配制不含任何随机性或环境相关状态:取液量在分辨率格点上确定性地
+  选择浓度误差最小者（并列取较少取液量），孔按行优先、来源按 id 排序,
+  指令分“先稀释液、后来源液”两阶段生成;相同输入（含分辨率、最小吸取量、
+  容差等全部参数）必然得到逐位一致的指令序列、每孔实际浓度与来源余量。
 
 ## 配置（环境变量）
 
@@ -736,10 +890,11 @@ app/
   reconciler.py 扫描核对与最少步数纠位指令生成（空孔链 → 闭环暂存）
   spatial_qc.py 组中位数中心化 + 行列中位数剥离（median polish）与组内置换检验
   release.py   批次放行两级门控:扫描吻合核验（复用纠位规则）→ 空间质控放行门
+  dilution.py  稀释梯度配制:共享库存核对 + 分辨率格点取整/容差选择 + 确定性移液指令
   blinding.py  双人协作盲化/解盲:AES-256-GCM 认证加密映射包 + XOR 双份额
   metrics.py   指标独立重算与布局约束校验
   plates.py    板型预设与孔位命名解析
-tests/         pytest 测试（解析、求解、API、纠位、空间质控、批次放行、盲化解盲）
+tests/         pytest 测试（解析、求解、API、纠位、空间质控、批次放行、稀释配制、盲化解盲）
 Dockerfile     单容器构建
 docker-compose.yml  单命令启动
 ```
