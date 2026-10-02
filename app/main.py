@@ -11,9 +11,10 @@ from .metrics import compute_spreads, count_adjacent_pairs, verify_layout
 from .planner import InfeasibleArrangement, SolverTimeout, plan_layout
 from .plates import parse_well
 from .blinding import BlindInvalid, blind, unblind
+from .dilution import DilutionPlanInvalid, dilution_plan
 from .reconciler import ReconcileInvalid, StagingConflict, reconcile
 from .release import ReleaseInvalid, batch_release
-from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, ReconcileRequest, SpatialQCRequest, UnblindRequest
+from .schemas import ArrangeRequest, BatchReleaseRequest, BlindRequest, DilutionPlanRequest, ReconcileRequest, SpatialQCRequest, UnblindRequest
 from .spatial_qc import SpatialQCInvalid, spatial_qc
 
 app = FastAPI(
@@ -146,6 +147,22 @@ async def blind_invalid_handler(request: Request, exc: BlindInvalid) -> JSONResp
             "detail": "The blinding request failed; "
             "no blind codes, mapping package or shares are produced "
             "(unblinding reveals no partial mapping).",
+            "infeasibility_categories": exc.categories,
+            "messages": exc.messages,
+        },
+    )
+
+
+@app.exception_handler(DilutionPlanInvalid)
+async def dilution_invalid_handler(request: Request, exc: DilutionPlanInvalid) -> JSONResponse:
+    # 422 whenever any target well cannot be met (insufficient shared
+    # source stock, well over capacity, concentration unreachable, no
+    # pipette-grid solution within tolerance); no partial plan is emitted.
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "No dilution plan can satisfy every target well; "
+            "no pipetting instructions were generated.",
             "infeasibility_categories": exc.categories,
             "messages": exc.messages,
         },
@@ -293,6 +310,18 @@ async def spatial_qc_arrangement(req: SpatialQCRequest) -> dict:
 )
 async def batch_release_arrangement(req: BatchReleaseRequest) -> dict:
     return batch_release(req)
+
+
+@app.post(
+    "/api/v1/arrangements/dilution-plan",
+    summary="为既有 layout 生成稀释梯度配制计划(确定性逐步移液指令)",
+    responses={
+        200: {"description": "返回逐步移液指令、每孔实际浓度与各来源样本用量/余量"},
+        422: {"description": "来源库存不足、目标超容量或分辨率取整后无法达标,逐项列因,不输出部分计划"},
+    },
+)
+async def create_dilution_plan(req: DilutionPlanRequest) -> dict:
+    return dilution_plan(req)
 
 
 @app.post(
